@@ -1,6 +1,0 @@
-/root/xx/minisql/build/CMakeFiles/minisql_core.dir
-/root/xx/minisql/build/CMakeFiles/minisql.dir
-/root/xx/minisql/build/CMakeFiles/test_pager.dir
-/root/xx/minisql/build/CMakeFiles/test.dir
-/root/xx/minisql/build/CMakeFiles/edit_cache.dir
-/root/xx/minisql/build/CMakeFiles/rebuild_cache.dir

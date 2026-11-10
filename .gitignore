@@ -1,0 +1,14 @@
+# CMake build files
+build/
+
+# Object files
+*.o
+*.o.d
+
+# Static and dynamic libraries
+*.a
+*.so
+
+# Database files
+*.db
+*.db-journal
