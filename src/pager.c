@@ -207,3 +207,19 @@ minisql_errno pager_flush(minisql_pager *pager){
     }
     return rc;
 }
+
+minisql_errno pager_close(minisql_pager *pager){
+    if(pager == NULL){
+        return MINISQL_OK;
+    }
+    minisql_errno rc = MINISQL_OK;
+    minisql_errno plu = pager_flush(pager);
+    if(plu != MINISQL_OK && rc == MINISQL_OK) rc = plu; /*flush失败继续释放内存，直接return会泄露内存*/
+    free(pager->buckets);
+    free(pager->frames);
+    if(close(pager->fd) == -1){
+        if(rc == MINISQL_OK) rc = minisql_errno_sys(errno);
+    }
+    free(pager);
+    return rc;
+}
