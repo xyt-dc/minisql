@@ -1,0 +1,18 @@
+Start testing: Nov 04 16:02 UTC
+----------------------------------------------------------
+1/1 Testing: pager
+1/1 Test: pager
+Command: "/root/xx/minisql/build/test_pager"
+Directory: /root/xx/minisql/build
+"pager" start time: Nov 04 16:02 UTC
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"pager" end time: Nov 04 16:02 UTC
+"pager" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Nov 04 16:02 UTC

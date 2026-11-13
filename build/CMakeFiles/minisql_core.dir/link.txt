@@ -1,0 +1,2 @@
+/usr/bin/ar qc libminisql_core.a CMakeFiles/minisql_core.dir/src/common.c.o CMakeFiles/minisql_core.dir/src/pager.c.o CMakeFiles/minisql_core.dir/src/db.c.o
+/usr/bin/ranlib libminisql_core.a
