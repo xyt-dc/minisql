@@ -17,13 +17,13 @@ struct minisql_page {
 };
 struct minisql_pager{
     int fd;
-    minisql_page *frames; /*缓存帧*/
+    minisql_page *frames; /*缓存帧  LRU 链表中的页面不是重新分配出来的，它们仍然是 frames 数组里的那些对象，只是通过 lru_prev 和 lru_next 连接起来。*/    
     
     uint32_t cache_capacity;
     uint32_t cache_count;
 
-    minisql_page *lru_head;
-    minisql_page *lru_tail;
+    minisql_page *lru_head; /*链表头 lru_head：最近使用过的页面。*/
+    minisql_page *lru_tail;/*链表尾 lru_tail：最久没有使用的页面。 */
     
 
     minisql_page **buckets;
@@ -154,7 +154,7 @@ fail_pager:
 */
 static minisql_errno pager_write_page(minisql_pager *pager,minisql_page *page){
     if(pager == NULL || page == NULL){
-        return MINISQL_ERR_IO; /*调用者传入的参数不合法。??这不属于正常的文件 I/O 错误，更不能返回成功。*/
+        return MINISQL_ERR_INVALID; /*调用者传入的参数不合法。这不属于正常的文件 I/O 错误，更不能返回成功。*/
     }
     if(page->pgno == MINISQL_PGNO_NULL || page->pgno >= pager->page_count){
         return MINISQL_ERR_CORRUPT; /*空页框或越界页不能写盘*/
@@ -223,3 +223,95 @@ minisql_errno pager_close(minisql_pager *pager){
     free(pager);
     return rc;
 }
+/*@brief 解除缓存页面的一次固定引用，并记录页面修改状态。
+ *
+ * 当上层使用完页面后，将 pin 引用计数减 1。
+ * 如果 dirty 非 0，则将页面标记为脏页，等待后续写回磁盘。
+ * 如果 dirty 为 0，则保留页面原有的脏页状态。
+ *
+ * 当 pin 降为 0 时，页面可以参与 LRU 淘汰候选。
+ * 本函数不释放页面内存，也不直接写回磁盘。
+ *
+ * @param pager 页面缓存管理器。
+ * @param pg    需要解除固定引用的缓存页面。
+ * @param dirty 是否在本次使用中修改了页面（0：未修改；非 0：已修改）。
+*/
+minisql_errno pager_unpin(minisql_pager *pager,minisql_page *page,int dirty){
+    if (pager == NULL || page == NULL){
+        return MINISQL_ERR_INVALID; 
+    }
+    if(page->pgno == MINISQL_PGNO_NULL){
+        return MINISQL_ERR_INVALID;
+    }
+    if(dirty) page->dirty = true;
+    if(page->pin < 0){
+        assert(page->pin >= 0);
+        return MINISQL_ERR_INVALID;
+    }  
+   
+    if(page->pin == 0) lru_touch(pager,page); /*???*/
+    else page->pin--;
+    return MINISQL_OK;
+}
+
+/*将一个链表中的page摘下来*/
+static void lru_remove(minisql_pager *pager,minisql_page *page){
+    assert(pager != NULL && page != NULL);
+    if(page->lru_prev != NULL){
+        page->lru_prev->lru_next = page->lru_next; 
+    }       
+    else pager->lru_head = page->lru_next; /* 没有左邻居 ⟹ page 是 head */
+    if(page->lru_next != NULL){
+        page->lru_next->lru_prev = page->lru_prev;
+    }
+    else pager->lru_tail = page->lru_prev; /* 没有右邻居 ⟹ page 是 tail */
+
+    /*从链上摘下 → 清空自身指针*/
+    page->lru_prev = NULL;
+    page->lru_next = NULL;
+}
+
+/*将一个页面节点插入 LRU 双向链表的头部，让它成为最近使用的页面。
+*将一个最近新的使用的页面（page未在链表中）加入LRU链表中
+*lru_push_front()：要求传入的 page 尚未加入 LRU 链表。
+*lru_touch()：要求传入的 page 已经在 LRU 链表中。
+*lru_remove()：要求传入的 page 已经在 LRU 链表中。
+*/
+static void lru_push_front(minisql_pager *pager,minisql_page *page){
+    assert(page->lru_prev == NULL && page->lru_next == NULL); /*一次性挡住“重复插入 / free_frames 残留 / 忘 remove”*/
+    page->lru_prev = NULL; /*入链前显式置 NULL*/
+ //    
+//     情况一：链表原本为空
+//    if(pager->lru_head == NULL ){  /*head 为 NULL 时 tail 必然是 NULL*/
+//         pager->lru_head = pager->lru_tail = page;
+//    }
+//    *情况二：链表原本有节点
+//    else 
+//    {
+//     page->lru_next = pager->lru_head;
+//     pager->lru_head->lru_prev = page; /*原来的head不要忘记回指*/
+//     pager->lru_head = page;
+//    }
+/*合并两种情况， “旧 head 是否为 NULL”一个判断同时决定了 tail 要不要更新*/ 
+    page->lru_next = pager->lru_head;
+   if(pager->lru_head) {
+    pager->lru_head->lru_prev = page;  
+   }                
+   else pager->lru_tail = page;
+   pager->lru_head = page; /*把 head 的更新移出分支*/
+}
+
+// 1. 如果 page 已经是头节点，直接返回。
+// 2. 调用 lru_remove()，从原位置摘除。
+// 3. 调用 lru_push_front()，插入链表头部。
+/*将链表中的page移到head*/
+static void lru_touch(minisql_pager *pager,minisql_page *page){
+    if(page == pager->lru_head) return;              
+    else{
+     lru_remove(pager,page);
+     lru_push_front (pager,page);   
+    }
+
+}
+
+
