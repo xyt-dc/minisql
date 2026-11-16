@@ -1,1 +1,0 @@
-/usr/bin/cc -g CMakeFiles/test_pager.dir/tests/test_pager.c.o -o test_pager  libminisql_core.a 

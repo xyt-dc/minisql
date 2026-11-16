@@ -12,3 +12,6 @@ build/
 # Database files
 *.db
 *.db-journal
+
+# 误创建的空文件
+ai

@@ -1,1 +1,0 @@
-/usr/bin/cc -g CMakeFiles/minisql.dir/src/main.c.o -o minisql  libminisql_core.a 
