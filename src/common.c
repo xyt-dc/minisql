@@ -8,6 +8,7 @@ switch(rc){
     case MINISQL_ERR_NOMEM: return "Out of memory";
     case MINISQL_ERR_NOTIMPL: return "Not implemented";
     case MINISQL_ERR_NOSPC: return "No space left on device";
+    case MINISQL_ERR_CACHE_FULL: return "Page cache full (all frames pinned)";
     default: return "Unknown error code";
 }
 }

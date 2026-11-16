@@ -10,7 +10,7 @@ struct minisql_page {
     minisql_pgno pgno; /*这个缓存帧当前存放的是数据库文件中的第几页;MINISQL_PGNO_NULL 表示空页框（这个缓存帧目前没有对应的数据库页面。）*/ 
     int pin;
     bool dirty; /*和磁盘是否一致,f表示干净页，true表示脏页*/
-    minisql_page *hnext;
+    minisql_page *hnext; // 哈希链表的下一个节点*/
     minisql_page *lru_prev;
     minisql_page *lru_next;
     uint8_t data[MINISQL_PAGE_SIZE]; /*页内容 */
@@ -20,7 +20,7 @@ struct minisql_pager{
     minisql_page *frames; /*缓存帧  LRU 链表中的页面不是重新分配出来的，它们仍然是 frames 数组里的那些对象，只是通过 lru_prev 和 lru_next 连接起来。*/    
     
     uint32_t cache_capacity;
-    uint32_t cache_count;
+    uint32_t cache_count; /*当前已经占用的缓存帧数量*/
 
     minisql_page *lru_head; /*链表头 lru_head：最近使用过的页面。*/
     minisql_page *lru_tail;/*链表尾 lru_tail：最久没有使用的页面。 */
@@ -35,6 +35,10 @@ struct minisql_pager{
     uint32_t root_page;
     
 };
+static void lru_remove(minisql_pager *pager, minisql_page *page);
+static void lru_push_front(minisql_pager *pager, minisql_page *page);
+static void lru_touch(minisql_pager *pager, minisql_page *page);
+static minisql_errno pager_write_page(minisql_pager *pager, minisql_page *page);
 uint8_t *page_data(minisql_page* page){
     return page->data;
 }
@@ -109,7 +113,7 @@ minisql_errno pager_open(const char* filename,uint32_t cache_pages,minisql_pager
     pager->hash_mask = pager->cache_capacity - 1; /*？？hash_mask用来干什么的*/
 
     /*分配缓存页框数组和哈希桶数组‌：frames 数组存放缓存页框，buckets 数组存放哈希桶指针*/
-    minisql_page *frames = calloc(pager->cache_capacity,sizeof(minisql_page)); /*返回首页框的地址*/
+    minisql_page *frames = calloc(pager->cache_capacity,sizeof(minisql_page)); /*返回首页框的地址。数组的元素是 minisql_page 结构体本身。*/
     if(!frames){
         
         rc= MINISQL_ERR_NOMEM;
@@ -244,13 +248,13 @@ minisql_errno pager_unpin(minisql_pager *pager,minisql_page *page,int dirty){
         return MINISQL_ERR_INVALID;
     }
     if(dirty) page->dirty = true;
-    if(page->pin < 0){
-        assert(page->pin >= 0);
+    if(page->pin <= 0){      /* 先防风控：能不能减 */
+        assert(page->pin > 0);
         return MINISQL_ERR_INVALID;
     }  
    
-    if(page->pin == 0) lru_touch(pager,page); /*???*/
-    else page->pin--;
+    page->pin--;
+    if(page->pin == 0) lru_touch(pager,page); /* 减完才判断是否归零 */
     return MINISQL_OK;
 }
 
@@ -279,6 +283,7 @@ static void lru_remove(minisql_pager *pager,minisql_page *page){
 */
 static void lru_push_front(minisql_pager *pager,minisql_page *page){
     assert(page->lru_prev == NULL && page->lru_next == NULL); /*一次性挡住“重复插入 / free_frames 残留 / 忘 remove”*/
+    assert(pager != NULL && page != NULL);
     page->lru_prev = NULL; /*入链前显式置 NULL*/
  //    
 //     情况一：链表原本为空
@@ -306,6 +311,7 @@ static void lru_push_front(minisql_pager *pager,minisql_page *page){
 // 3. 调用 lru_push_front()，插入链表头部。
 /*将链表中的page移到head*/
 static void lru_touch(minisql_pager *pager,minisql_page *page){
+    assert(pager != NULL && page != NULL);
     if(page == pager->lru_head) return;              
     else{
      lru_remove(pager,page);
@@ -314,4 +320,98 @@ static void lru_touch(minisql_pager *pager,minisql_page *page){
 
 }
 
+/*Hash 负责快速找到页面，LRU 负责管理页面的使用顺序。*/
+/*根据磁盘页号 pgno，判断这个页面是否已经存在于 Pager 缓存中。
+*找到了：返回对应的 minisql_page *。 没找到：返回 NULL。
 
+*思路：用 pgno & hash_mask 定位桶 → 沿 hnext 单链表遍历 → 比对 pgno → 命中返回页框，否则返回 NULL
+*/
+static minisql_page* hash_find(minisql_pager *pager,minisql_pgno pgno){
+    assert(pager != NULL);
+    assert(pager->buckets != NULL);
+    uint32_t index = pgno & pager->hash_mask;
+    for(minisql_page *cur = pager->buckets[index];cur != NULL;cur = cur->hnext){
+        if(cur->pgno == pgno) return cur;
+        //else continue;
+    }
+    return NULL;
+}
+/*把一个已经存在的缓存页面 page 插入 Pager 的哈希表中 (使用单链表头插法)*/
+/*Pager 的哈希表就是一个缓存目录，通过磁盘页号 pgno，快速判断该页面是否已经在内存缓存中，并找到它对应的缓存帧。 */
+/*1.frames：存放真正的缓存页面，每个页面有自己的 pgno。
+2.buckets：存放哈希链表的头指针，帮助快速定位缓存页面。
+3.查找时，根据目标 pgno 计算桶下标，只遍历对应桶的链表，而不是遍历整个 frames 数组。*/
+static void hash_insert(minisql_pager *pager,minisql_page *page){
+    assert(pager != NULL);
+    assert(page != NULL);
+    assert(pager->buckets != NULL);
+    assert(page->hnext == NULL);/*页框的 hnext 残留上一个主人的值，导致两条链被串到一起，之后 hash_remove 会截断别人的链*/
+    
+    uint32_t index = page->pgno & pager->hash_mask; 
+    page->hnext = pager->buckets[index]; /*←新节点的 next 指向原链头*/
+    pager->buckets[index] = page;      /*桶头改成新节点*/
+
+}
+
+/*page：被删除的对象*/
+static void hash_remove(minisql_pager *pager,minisql_page *page){
+    assert(pager != NULL);
+    assert(page != NULL);
+    assert(pager->buckets != NULL);
+
+    uint32_t index = page->pgno & pager->hash_mask;
+    minisql_page *prev = NULL;
+    minisql_page *cur = pager->buckets[index];
+    while(cur != page && cur != NULL){
+        prev = cur;
+        cur = cur->hnext;
+    }
+    assert(cur == page);
+    if(prev == NULL){
+        pager->buckets[index] = page->hnext;   
+    }
+    else{
+        prev->hnext = page->hnext;   
+    }
+    page->hnext = NULL;
+}
+
+/*frame_acquire() 负责为即将加载的磁盘页面，找到一个可以使用的内存缓存帧。*/
+static minisql_errno frame_acquire(minisql_pager *pager,minisql_page **frame_out){
+    assert(pager != NULL);
+    assert(frame_out != NULL);
+    /*先判断有没有空闲缓存帧*/
+    /*这比O(n)扫数组快*/
+    minisql_page *frame = pager->free_frames;
+    if(frame != NULL){
+        pager->free_frames = frame->lru_next;
+        frame->lru_next = NULL;
+        *frame_out = frame; 
+        pager->cache_count++;
+        assert(pager->cache_count <= pager->cache_capacity);
+        return MINISQL_OK;
+    } 
+    /*没有空闲缓存帧的话，从LRU尾部一次寻找pin=0的缓存页，*/
+    minisql_page *cur = pager->lru_tail;
+    minisql_errno rc = MINISQL_OK;
+    while(cur != NULL){
+        if(cur->pin == 0){
+            if(cur->dirty) rc = pager_write_page(pager,cur);/*判断该页面是不是已修改过，需要写回*/
+            if(rc != MINISQL_OK) return rc;
+            hash_remove(pager,cur); /*page->hnext = NULL*/
+            lru_remove(pager,cur); /*将page lru_prev  lru_next 重置为NULL*/
+            cur->dirty = false;
+            cur->pgno = MINISQL_PGNO_NULL;
+            cur->pin = 0;
+            *frame_out = cur;
+            return MINISQL_OK;
+        }
+        cur = cur->lru_prev;
+    }
+    
+    *frame_out = NULL;
+    return MINISQL_ERR_CACHE_FULL;
+
+
+
+}
