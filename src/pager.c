@@ -383,6 +383,8 @@ static minisql_errno frame_acquire(minisql_pager *pager,minisql_page **frame_out
     /*先判断有没有空闲缓存帧*/
     /*这比O(n)扫数组快*/
     minisql_page *frame = pager->free_frames;
+    assert(frame->lru_prev == NULL);
+    assert(frame->hnext == NULL);
     if(frame != NULL){
         pager->free_frames = frame->lru_next;
         frame->lru_next = NULL;
@@ -411,7 +413,21 @@ static minisql_errno frame_acquire(minisql_pager *pager,minisql_page **frame_out
     
     *frame_out = NULL;
     return MINISQL_ERR_CACHE_FULL;
+}
+minisql_errno pager_get(minisql_pager *pager,minisql_pgno pgno,minisql_page **page_out){
+    assert(pager != NULL);
+    assert(page_out != NULL); /*需不需要这个？*/
+    assert(pgno < pager->page_count); /*是不是不能等于，因为包括头页了*/
+    minisql_page *frame_ptr = NULL;
+    frame_ptr = hash_find(pager,pgno);
+    if(frame_ptr != NULL){ 
+        frame_ptr->pin ++;
+        lru_touch(pager,frame_ptr);
+        *page_out = frame_ptr;
+    }
 
-
+    minisql_errno rc = MINISQL_OK;
+    rc = frame_acquire(pager,&frame_ptr);
+    
 
 }
