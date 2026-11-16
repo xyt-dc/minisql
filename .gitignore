@@ -1,17 +1,40 @@
 # CMake build files
 build/
+cmake-build-*/
 
 # Object files
 *.o
 *.o.d
+*.obj
 
 # Static and dynamic libraries
 *.a
 *.so
+*.so.*
+*.dylib
+*.dll
 
-# Database files
+# Executables
+minisql
+test_pager
+*.exe
+
+# Database / test artifacts
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 
-# 误创建的空文件
-ai
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+
+# Core dumps
+core
+core.*
+vgcore.*
