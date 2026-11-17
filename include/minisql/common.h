@@ -12,7 +12,7 @@ typedef uint32_t minisql_pgno;  /*页号*/
 typedef enum {
     MINISQL_OK          = 0,    /* 成功 */
     MINISQL_ERR_IO      = -1,   /* 底层 read/write/pread/pwrite 失败 */
-    MINISQL_ERR_CORRUPT = -2,   /* 文件格式损坏（魔数、页号越界等） */
+    MINISQL_ERR_CORRUPT = -2,   /* 文件格式损坏（魔数、页号越界等）*/
     MINISQL_ERR_NOMEM   = -3,   /* 内存分配失败 */
     MINISQL_ERR_NOTIMPL = -4,   /* 功能尚未实现（当前骨架阶段） */
     MINISQL_ERR_NOSPC   = -5,   /* 磁盘空间/配额不足，清理后可重试 */

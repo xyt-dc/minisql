@@ -22,13 +22,13 @@ struct minisql_pager{
     uint32_t cache_capacity;
     uint32_t cache_count; /*当前已经占用的缓存帧数量*/
 
-    minisql_page *lru_head; /*链表头 lru_head：最近使用过的页面。*/
-    minisql_page *lru_tail;/*链表尾 lru_tail：最久没有使用的页面。 */
+    minisql_page *lru_head; /*链表头 lru_head：最近使用过的页面。   可被复用*/
+    minisql_page *lru_tail;/*链表尾 lru_tail：最久没有使用的页面。 可被复用 */
     
 
     minisql_page **buckets;
     uint32_t hash_mask;
-    minisql_page *free_frames;
+    minisql_page *free_frames; /*链表的头指针*/
 
     uint32_t page_count;  
     uint32_t freelist_head;
@@ -39,6 +39,7 @@ static void lru_remove(minisql_pager *pager, minisql_page *page);
 static void lru_push_front(minisql_pager *pager, minisql_page *page);
 static void lru_touch(minisql_pager *pager, minisql_page *page);
 static minisql_errno pager_write_page(minisql_pager *pager, minisql_page *page);
+static void frame_release(minisql_pager *pager, minisql_page *frame);
 uint8_t *page_data(minisql_page* page){
     return page->data;
 }
@@ -414,20 +415,85 @@ static minisql_errno frame_acquire(minisql_pager *pager,minisql_page **frame_out
     *frame_out = NULL;
     return MINISQL_ERR_CACHE_FULL;
 }
+/*
+ * frame_release - 释放缓存帧，将其放回空闲链表。
+ *
+ * 重置页框状态，将其标记为空闲。
+ * 使用 lru_next 串联空闲链表，并插入链表头部。
+ * 最后减少已使用缓存帧数量。
+ *
+ * 注意：调用前必须确保该页框已从 Hash 和 LRU 链表中移除。
+ */
+static void frame_release(minisql_pager *pager,minisql_page *frame){
+    assert(pager != NULL && frame != NULL);
+    assert(pager->cache_count > 0);      /* 不能减成负数 */
+    frame->pin = 0;
+    frame->dirty = false;
+    frame->pgno = MINISQL_PGNO_NULL;
+    /*「LRU 顺序」只在页框处于 LRU 链上时成立。 一旦它回到空闲链，这个字段就不再承载时间顺序语义，而是被借用来串空闲链。*/
+    frame->lru_prev = NULL;
+    frame->lru_next = pager->free_frames;
+    frame->hnext = NULL;
+    pager->free_frames = frame;
+    pager->cache_count--;
+
+}
+/*
+ * pager_get - 获取指定磁盘页对应的缓存帧。
+ *
+ * 1. 缓存命中：增加 pin 计数，更新 LRU，返回缓存帧。
+ * 2. 缓存未命中：获取可用页框，从磁盘读取完整页面，
+ *    初始化页框状态，并插入 Hash 和 LRU 链表。
+ * 3. 读取失败：释放已获取的页框，返回错误码。
+ *
+ * 参数：
+ * pager    - Pager 管理器。
+ * pgno     - 目标磁盘页号。
+ * page_out - 输出参数，用于返回缓存帧地址。
+ *
+ * 注意：成功获取页面后，调用者必须调用 pager_unpin()。
+ */
 minisql_errno pager_get(minisql_pager *pager,minisql_pgno pgno,minisql_page **page_out){
     assert(pager != NULL);
-    assert(page_out != NULL); /*需不需要这个？*/
-    assert(pgno < pager->page_count); /*是不是不能等于，因为包括头页了*/
+    assert(page_out != NULL); /*传一个已知的地址，地址指向的指针变量用来保存需要返回的页框地址*/
+    if (pgno == MINISQL_PGNO_NULL) return MINISQL_ERR_INVALID;
+    if (pgno >= pager->page_count) return MINISQL_ERR_CORRUPT; /* *不能用assert校验调用方输入   不能等于，因为包括头页了*/
+    /*情况一：经hash查找页面已存在在缓存页面中*/
     minisql_page *frame_ptr = NULL;
     frame_ptr = hash_find(pager,pgno);
     if(frame_ptr != NULL){ 
-        frame_ptr->pin ++;
-        lru_touch(pager,frame_ptr);
-        *page_out = frame_ptr;
+        frame_ptr->pin ++; /* 将页面的 pin 计数加 1*/
+        lru_touch(pager,frame_ptr); /*将页面移动到 LRU 链表头部。 */
+        *page_out = frame_ptr; /*返回该页面的缓存帧地址。*/
+        return MINISQL_OK;
     }
 
     minisql_errno rc = MINISQL_OK;
-    rc = frame_acquire(pager,&frame_ptr);
-    
-
+    rc = frame_acquire(pager,&frame_ptr); /*先找一个可用的缓存帧，用于存放缓存该页面*/
+    if(rc != MINISQL_OK) return rc;
+    /*pread() 只负责把磁盘中的数据读取到内存，并不会自动设置缓存帧的管理信息
+    *minisql_page 不仅保存页面数据，还保存了 Pager 管理缓存所需要的状态。
+    */
+    ssize_t got = 0;
+    while(got < MINISQL_PAGE_SIZE){
+    ssize_t n = pread(pager->fd,frame_ptr->data + got,MINISQL_PAGE_SIZE - got,(off_t)pgno*MINISQL_PAGE_SIZE + (off_t)got);
+        if(n == -1){
+            if(errno == EINTR) continue;
+            frame_release(pager,frame_ptr);
+            return minisql_errno_sys(errno);
+        }
+        if(n == 0){
+            frame_release(pager,frame_ptr);
+            return MINISQL_ERR_CORRUPT;
+        }
+         got += (size_t)n;
+    }
+    frame_ptr->pgno = pgno;
+    frame_ptr->pin = 1;
+    frame_ptr->dirty = false; /*刚通过 pread 从磁盘读进来的页，内容与磁盘完全一致*/
+    hash_insert(pager,frame_ptr);
+    lru_push_front(pager,frame_ptr);
+    *page_out = frame_ptr;
+    return MINISQL_OK;
 }
+
