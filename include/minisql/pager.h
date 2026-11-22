@@ -32,4 +32,14 @@ uint32_t pager_page_count(const minisql_pager *pager);
 
 minisql_errno pager_close(minisql_pager *pager);
 
+/* freelist 头页号的读写。
+ * freelist_head 的唯一权威存放在 pager 内部（pager_alloc / pager_free 直接改它），
+ * db 层只在上层通过这两个函数「装载」和「取出」：
+ *   - db_open 读到头页的值后，用 pager_set_freelist_head 灌进去
+ *   - db_flush 用 pager_freelist_head 取出当前值，写回头页
+ * 这样不会出现 pager 和 db 各存一份、互不同步的问题。
+ */
+minisql_pgno pager_freelist_head(const minisql_pager *pager);
+void pager_set_freelist_head(minisql_pager *pager, minisql_pgno head);
+
 #endif

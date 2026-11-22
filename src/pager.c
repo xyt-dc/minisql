@@ -580,7 +580,54 @@ minisql_errno pager_alloc(minisql_pager *pager,minisql_pgno *pgno_out, minisql_p
     return MINISQL_OK;
 }
 
-minisql_errno pager_free(minisql_pager *pager, minisql_pgno pgno){
-    if (pgno < 1 || pgno >= pager->page_count) return MINISQL_ERR_CORRUPT;
+/* 把一个在用页归还到 freelist。
+ * 契约：调用方必须保证该页当前没有被其他持有者引用，
+ *       且不得重复释放同一个页号（否则 freelist 成环）。
+ * 不改变 page_count，不缩小文件。 */
+minisql_errno pager_free(minisql_pager *pager, minisql_pgno pgno)
+{
+    if (pager == NULL) {
+        return MINISQL_ERR_IO;
+    }
+    /* 页 0 是头页，不能回收；越界页号一定是调用方出错 */
+    if (pgno < 1 || pgno >= pager->page_count) {
+        return MINISQL_ERR_CORRUPT;
+    }
 
+    minisql_page *pg = NULL;
+    minisql_errno rc = pager_get(pager, pgno, &pg);
+    if (rc != MINISQL_OK) {
+        return rc;
+    }
+
+    /* pager_get 之后 pin 至少是 1。大于 1 说明还有别的持有者，
+     * 现在释放会让它手里的页变成可利用的空闲页 —— 拒绝。 */
+    if (pg->pin != 1) {
+        pager_unpin(pager, pg, 0);
+        return MINISQL_ERR_INVALID;
+    }
+
+    /* 头插：我指向老的 head，再让自己成为新 head */
+    freelist_set_next(pg, pager->freelist_head);
+    pager->freelist_head = pgno;
+
+    /* dirty=1 必须传：坑位信息要落盘，否则重启后这个页永久泄漏 */
+    return pager_unpin(pager, pg, 1);
+}
+
+/* freelist_head 的读写口（db 层装载/取出用，权威只有 pager 这一份） */
+minisql_pgno pager_freelist_head(const minisql_pager *pager)
+{
+    if (pager == NULL) {
+        return MINISQL_PGNO_NULL;
+    }
+    return pager->freelist_head;
+}
+
+void pager_set_freelist_head(minisql_pager *pager, minisql_pgno head)
+{
+    if (pager == NULL) {
+        return;
+    }
+    pager->freelist_head = head;
 }

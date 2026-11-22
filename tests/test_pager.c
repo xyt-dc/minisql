@@ -1,13 +1,17 @@
 /*
  * tests/test_pager.c —— pager 层单元测试
  *
- * 覆盖范围（只测已实现的接口）：
+ * 覆盖范围：
  *   pager_open / pager_close / pager_get / pager_unpin / pager_flush
- *   page_data / pager_page_count
+ *   page_data / pager_page_count                    （用例 1-9）
+ *   pager_alloc / pager_free                        （用例 10-14）
  *
- * 未实现，故不测：pager_alloc / pager_free
- * 需要多页文件时，用 make_db_with_pages() 直接在底下铺 N 页全零，
- * 绕开尚未实现的 pager_alloc。
+ * 需要多页文件但不想走 alloc 时，用 make_db_with_pages() 直接铺 N 页全零。
+ *
+ * 已知未覆盖的契约（实现层面未做检测，靠调用方保证）：
+ *   - 重复 free 同一个页号会让 freelist 成环，pager_free 不做 O(n) 遍历检测。
+ *   - freelist_head 目前只活在 pager 内存里，尚未持久化到头页（待 db.c）。
+ *     因此重启后 alloc 不会复用旧页号，用例里不做这方面断言。
  *
  * 数据库文件用 /tmp 下的绝对路径，这样 ctest 在 build/ 目录下运行也能找到。
  */
@@ -371,6 +375,224 @@ static void test_lru_evict_and_writeback(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* 用例 10：alloc 路径 B —— 文件为空 freelist 时追加新页                */
+/* ------------------------------------------------------------------ */
+static void test_alloc_append(void)
+{
+    puts("[10] alloc 追加：文件真的变长、返回页号递增、内容全零");
+
+    db_reset();
+
+    minisql_pager *p = NULL;
+    CHECK_EQ(pager_open(DB_PATH, 8, &p), (long long)MINISQL_OK);
+    CHECK_EQ(pager_page_count(p), 1u);      /* 只有头页 */
+
+    minisql_pgno p1 = MINISQL_PGNO_NULL;
+    minisql_page *pg1 = NULL;
+    CHECK_EQ(pager_alloc(p, &p1, &pg1), (long long)MINISQL_OK);
+    CHECK_EQ(p1, 1u);                       /* 数据页从 1 开始，不能是头页 0 */
+    CHECK_EQ(pager_page_count(p), 2u);
+    CHECK(page_is(pg1, 0));                 /* 新页必须是全零 */
+    CHECK_EQ(pager_unpin(p, pg1, 0), (long long)MINISQL_OK);
+
+    /* 再分配一个，页号必须递增 */
+    minisql_pgno p2 = MINISQL_PGNO_NULL;
+    minisql_page *pg2 = NULL;
+    CHECK_EQ(pager_alloc(p, &p2, &pg2), (long long)MINISQL_OK);
+    CHECK_EQ(p2, 2u);
+    CHECK_EQ(pager_page_count(p), 3u);
+    CHECK(pg1 != pg2);
+    CHECK_EQ(pager_unpin(p, pg2, 0), (long long)MINISQL_OK);
+
+    /* 关键：文件必须真的变长了，否则重开时 page_count 会算错 */
+    CHECK_EQ(pager_flush(p), (long long)MINISQL_OK);
+    CHECK_EQ(pager_close(p), (long long)MINISQL_OK);
+
+    struct stat st;
+    CHECK_EQ(stat(DB_PATH, &st), 0);
+    CHECK_EQ((long long)st.st_size, 3LL * MINISQL_PAGE_SIZE);
+
+    /* 重开：看到 3 页，且能被正常读出来 */
+    p = NULL;
+    CHECK_EQ(pager_open(DB_PATH, 8, &p), (long long)MINISQL_OK);
+    CHECK_EQ(pager_page_count(p), 3u);
+    CHECK_EQ(pager_close(p), (long long)MINISQL_OK);
+}
+
+/* ------------------------------------------------------------------ */
+/* 用例 11：alloc 路径 A —— free 之后能复用同一个页号                   */
+/* ------------------------------------------------------------------ */
+static void test_alloc_reuse_after_free(void)
+{
+    puts("[11] alloc 复用：free 掉的页号会被下一次 alloc 拿回去");
+
+    db_reset();
+
+    minisql_pager *p = NULL;
+    CHECK_EQ(pager_open(DB_PATH, 8, &p), (long long)MINISQL_OK);
+
+    minisql_pgno a = MINISQL_PGNO_NULL;
+    minisql_pgno b = MINISQL_PGNO_NULL;
+    minisql_pgno c = MINISQL_PGNO_NULL;
+    minisql_page *pg = NULL;
+
+    CHECK_EQ(pager_alloc(p, &a, &pg), (long long)MINISQL_OK);   /* a == 1 */
+    CHECK_EQ(pager_unpin(p, pg, 0), (long long)MINISQL_OK);
+    CHECK_EQ(pager_alloc(p, &b, &pg), (long long)MINISQL_OK);   /* b == 2 */
+    CHECK_EQ(pager_unpin(p, pg, 0), (long long)MINISQL_OK);
+
+    CHECK_EQ(a, 1u);
+    CHECK_EQ(b, 2u);
+
+    uint32_t before = pager_page_count(p);   /* 3 */
+
+    /* 释放 a */
+    CHECK_EQ(pager_free(p, a), (long long)MINISQL_OK);
+
+    /* 下一次 alloc 必须复用 a，page_count 不增长 */
+    CHECK_EQ(pager_alloc(p, &c, &pg), (long long)MINISQL_OK);
+    CHECK_EQ(c, a);
+    CHECK_EQ(pager_page_count(p), before);   /* 没长 */
+    CHECK(page_is(pg, 0));                   /* 复用页已被清零，旧数据不残留 */
+    CHECK_EQ(pager_unpin(p, pg, 0), (long long)MINISQL_OK);
+
+    CHECK_EQ(pager_close(p), (long long)MINISQL_OK);
+}
+
+/* ------------------------------------------------------------------ */
+/* 用例 12：freelist LIFO 顺序 + 脏页内容不泄漏                        */
+/* ------------------------------------------------------------------ */
+static void test_freelist_lifo(void)
+{
+    puts("[12] freelist 是 LIFO：后 free 的先被 alloc 拿走，且旧数据被清掉");
+
+    db_reset();
+
+    minisql_pager *p = NULL;
+    CHECK_EQ(pager_open(DB_PATH, 8, &p), (long long)MINISQL_OK);
+
+    minisql_pgno n[4] = { 0, 0, 0, 0 };
+    minisql_page *pg = NULL;
+
+    for (int i = 0; i < 4; i++) {
+        CHECK_EQ(pager_alloc(p, &n[i], &pg), (long long)MINISQL_OK);
+        /* 往里塞垃圾，验证复用时会清零 */
+        fill_page(pg, (uint8_t)('a' + i));
+        CHECK_EQ(pager_unpin(p, pg, 1), (long long)MINISQL_OK);  /* 标脏 */
+    }
+    CHECK_EQ(pager_page_count(p), 5u);   /* 头页 + 4 个数据页 */
+
+    /* 按 1,2,3,4 的顺序 free -> freelist 变成 4 -> 3 -> 2 -> 1 */
+    for (int i = 0; i < 4; i++) {
+        CHECK_EQ(pager_free(p, n[i]), (long long)MINISQL_OK);
+    }
+
+    /* LIFO：先拿回 4，再 3、2、1 */
+    for (int i = 3; i >= 0; i--) {
+        minisql_pgno got = MINISQL_PGNO_NULL;
+        CHECK_EQ(pager_alloc(p, &got, &pg), (long long)MINISQL_OK);
+        CHECK_EQ(got, n[i]);
+        CHECK(page_is(pg, 0));   /* 复用的页必须清零，不能是 'a'+i */
+        CHECK_EQ(pager_unpin(p, pg, 0), (long long)MINISQL_OK);
+    }
+
+    /* 全部取完后，再 alloc 应该走路径 B */
+    minisql_pgno fresh = MINISQL_PGNO_NULL;
+    CHECK_EQ(pager_alloc(p, &fresh, &pg), (long long)MINISQL_OK);
+    CHECK_EQ(fresh, 5u);
+    CHECK_EQ(pager_page_count(p), 6u);
+    CHECK_EQ(pager_unpin(p, pg, 0), (long long)MINISQL_OK);
+
+    CHECK_EQ(pager_close(p), (long long)MINISQL_OK);
+}
+
+/* ------------------------------------------------------------------ */
+/* 用例 13：free / alloc 的参数与状态校验                              */
+/* ------------------------------------------------------------------ */
+static void test_free_alloc_bounds(void)
+{
+    puts("[13] free/alloc 边界：头页不可 free、越界拒绝、pin 中的页拒绝 free");
+
+    db_reset();
+
+    minisql_pager *p = NULL;
+    CHECK_EQ(pager_open(DB_PATH, 8, &p), (long long)MINISQL_OK);
+
+    minisql_pgno a = MINISQL_PGNO_NULL;
+    minisql_page *pg = NULL;
+    CHECK_EQ(pager_alloc(p, &a, &pg), (long long)MINISQL_OK);   /* a == 1 */
+    CHECK_EQ(pager_unpin(p, pg, 0), (long long)MINISQL_OK);
+
+    /* 页 0 是头页，绝不能进 freelist */
+    CHECK_EQ(pager_free(p, MINISQL_PGNO_HEADER), (long long)MINISQL_ERR_CORRUPT);
+    /* MINISQL_PGNO_NULL 是哨兵，不是页号 */
+    CHECK_EQ(pager_free(p, MINISQL_PGNO_NULL), (long long)MINISQL_ERR_CORRUPT);
+    /* 越界 */
+    CHECK_EQ(pager_free(p, 999), (long long)MINISQL_ERR_CORRUPT);
+    /* NULL pager */
+    CHECK_EQ(pager_free(NULL, 1), (long long)MINISQL_ERR_IO);
+
+    /* 页还被别人 pin 着时不能 free */
+    minisql_page *held = NULL;
+    CHECK_EQ(pager_get(p, a, &held), (long long)MINISQL_OK);    /* pin == 1 */
+    CHECK_EQ(pager_free(p, a), (long long)MINISQL_ERR_INVALID); /* 拒绝 */
+
+    /* 被拒绝后 freelist 不能被动过：alloc 必须走路径 B，拿到新页号 */
+    minisql_pgno n = MINISQL_PGNO_NULL;
+    minisql_page *np = NULL;
+    CHECK_EQ(pager_alloc(p, &n, &np), (long long)MINISQL_OK);
+    CHECK_EQ(n, 2u);            /* 不是 a == 1，说明 freelist 仍是空的 */
+    CHECK_EQ(pager_unpin(p, np, 0), (long long)MINISQL_OK);
+
+    /* 放掉引用后就能 free 了 */
+    CHECK_EQ(pager_unpin(p, held, 0), (long long)MINISQL_OK);
+    CHECK_EQ(pager_free(p, a), (long long)MINISQL_OK);
+
+    /* alloc 必须拿回 a */
+    minisql_pgno got = MINISQL_PGNO_NULL;
+    CHECK_EQ(pager_alloc(p, &got, &np), (long long)MINISQL_OK);
+    CHECK_EQ(got, a);
+    CHECK_EQ(pager_unpin(p, np, 0), (long long)MINISQL_OK);
+
+    CHECK_EQ(pager_close(p), (long long)MINISQL_OK);
+}
+
+/* ------------------------------------------------------------------ */
+/* 用例 14：free 之后的页必须落盘为"空闲"，重启后内容不被当真数据读       */
+/* ------------------------------------------------------------------ */
+static void test_free_persists_content(void)
+{
+    puts("[14] free 后 flush：重启读到的是被清零的复用页，没有旧数据残留");
+
+    db_reset();
+
+    minisql_pager *p = NULL;
+    minisql_page *pg = NULL;
+    minisql_pgno a = MINISQL_PGNO_NULL;
+
+    CHECK_EQ(pager_open(DB_PATH, 8, &p), (long long)MINISQL_OK);
+    CHECK_EQ(pager_alloc(p, &a, &pg), (long long)MINISQL_OK);
+    fill_page(pg, 0xEE);                       /* 写入特征值 */
+    CHECK_EQ(pager_unpin(p, pg, 1), (long long)MINISQL_OK);
+    CHECK_EQ(pager_free(p, a), (long long)MINISQL_OK);
+    CHECK_EQ(pager_flush(p), (long long)MINISQL_OK);
+    CHECK_EQ(pager_close(p), (long long)MINISQL_OK);
+
+    /* 重开：freelist_head 还没持久化（待 db.c），所以这里不检查复用行为，
+     * 只检查磁盘上这一页确实被写回过（内容不是全 0xEE）。 */
+    p = NULL;
+    CHECK_EQ(pager_open(DB_PATH, 8, &p), (long long)MINISQL_OK);
+    CHECK_EQ(pager_page_count(p), 2u);          /* 头页 + 1 */
+
+    minisql_page *rd = NULL;
+    CHECK_EQ(pager_get(p, a, &rd), (long long)MINISQL_OK);
+    /* 前 4 字节是 freelist next == NULL，所以整页不可能是 0xEE */
+    CHECK(!page_is(rd, 0xEE));
+    CHECK_EQ(pager_unpin(p, rd, 0), (long long)MINISQL_OK);
+    CHECK_EQ(pager_close(p), (long long)MINISQL_OK);
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                               */
 /* ------------------------------------------------------------------ */
 int main(void)
@@ -387,6 +609,13 @@ int main(void)
     test_pin_count();               /* 7 */
     test_cache_full();              /* 8 */
     test_lru_evict_and_writeback(); /* 9 */
+
+    /* alloc / free */
+    test_alloc_append();            /* 10 */
+    test_alloc_reuse_after_free();  /* 11 */
+    test_freelist_lifo();           /* 12 */
+    test_free_alloc_bounds();       /* 13 */
+    test_free_persists_content();   /* 14 */
 
     db_reset();
 
