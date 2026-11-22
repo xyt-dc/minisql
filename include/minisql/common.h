@@ -7,7 +7,7 @@
 typedef uint32_t minisql_pgno;  /*页号*/
 #define MINISQL_PGNO_HEADER  0u  /*页0放文件头*/
 #define MINISQL_PGNO_NULL    0xFFFFFFFFu
-
+#define MINISQL_FREELIST_NEXT_OFFSET 0u
 /* 统一错误码 */
 typedef enum {
     MINISQL_OK          = 0,    /* 成功 */

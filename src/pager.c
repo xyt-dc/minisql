@@ -6,6 +6,7 @@
 #include<assert.h>
 #include<stdbool.h>
 #include<errno.h>
+#include<string.h>
 struct minisql_page {
     minisql_pgno pgno; /*这个缓存帧当前存放的是数据库文件中的第几页;MINISQL_PGNO_NULL 表示空页框（这个缓存帧目前没有对应的数据库页面。）*/ 
     int pin;
@@ -31,7 +32,7 @@ struct minisql_pager{
     minisql_page *free_frames; /*链表的头指针*/
 
     uint32_t page_count;  
-    uint32_t freelist_head;
+    minisql_pgno freelist_head; /*磁盘空闲页面链表头页号   */
     uint32_t root_page;
     
 };
@@ -99,7 +100,7 @@ minisql_errno pager_open(const char* filename,uint32_t cache_pages,minisql_pager
     static const uint8_t zero_page[MINISQL_PAGE_SIZE];   /* 全零，BSS   const 也有实际作用：程序运行期间这块内存只读，被放进只读段，误写会立刻段错误（而不是静默改坏）。pwrite 的签名是 const void *buf，兼容。*/
         if (pwrite(fd, zero_page, MINISQL_PAGE_SIZE, 0) != MINISQL_PAGE_SIZE) {
             rc = MINISQL_ERR_IO;
-            goto fail_pager;   /* 注意此时 pager 还没分配，要调整 goto 目标 */
+            goto fail_frames;   /* 注意此时 pager 已经分配 */
     }
         pager->page_count = 1;  
     }
@@ -167,13 +168,6 @@ static minisql_errno pager_write_page(minisql_pager *pager,minisql_page *page){
     off_t offset = (off_t)page->pgno*MINISQL_PAGE_SIZE; 
     size_t written = 0;
     while(written < MINISQL_PAGE_SIZE){
-
-         /*ssize_t pwrite(int fd,const void *buf,size_t count,off_t offset);
-        *fd：文件描述符。
-        *buf：要写入的数据在内存中的地址。
-        *count：写入多少字节。
-        *offset：从文件的哪个字节位置开始写。
-        *ssize_t:实际成功写入的字节数，失败返回 -1*/
         ssize_t n = pwrite(pager->fd,page->data + written,MINISQL_PAGE_SIZE - written,offset + (off_t)written);
         if(n == -1){
             if(errno == EINTR) continue;
@@ -384,9 +378,10 @@ static minisql_errno frame_acquire(minisql_pager *pager,minisql_page **frame_out
     /*先判断有没有空闲缓存帧*/
     /*这比O(n)扫数组快*/
     minisql_page *frame = pager->free_frames;
-    assert(frame->lru_prev == NULL);
-    assert(frame->hnext == NULL);
+    
     if(frame != NULL){
+        assert(frame->lru_prev == NULL);
+        assert(frame->hnext == NULL);
         pager->free_frames = frame->lru_next;
         frame->lru_next = NULL;
         *frame_out = frame; 
@@ -412,7 +407,7 @@ static minisql_errno frame_acquire(minisql_pager *pager,minisql_page **frame_out
         cur = cur->lru_prev;
     }
     
-    *frame_out = NULL;
+    *frame_out = NULL;  /*找一圈没找到pin= 0 缓存帧*/
     return MINISQL_ERR_CACHE_FULL;
 }
 /*
@@ -439,7 +434,7 @@ static void frame_release(minisql_pager *pager,minisql_page *frame){
 
 }
 /*
- * pager_get - 获取指定磁盘页对应的缓存帧。
+ * pager_get - 获取一个已经存在的磁盘页对应的缓存帧。
  *
  * 1. 缓存命中：增加 pin 计数，更新 LRU，返回缓存帧。
  * 2. 缓存未命中：获取可用页框，从磁盘读取完整页面，
@@ -477,7 +472,7 @@ minisql_errno pager_get(minisql_pager *pager,minisql_pgno pgno,minisql_page **pa
     ssize_t got = 0;
     while(got < MINISQL_PAGE_SIZE){
     ssize_t n = pread(pager->fd,frame_ptr->data + got,MINISQL_PAGE_SIZE - got,(off_t)pgno*MINISQL_PAGE_SIZE + (off_t)got);
-        if(n == -1){
+        if(n == -1)         {
             if(errno == EINTR) continue;
             frame_release(pager,frame_ptr);
             return minisql_errno_sys(errno);
@@ -497,3 +492,95 @@ minisql_errno pager_get(minisql_pager *pager,minisql_pgno pgno,minisql_page **pa
     return MINISQL_OK;
 }
 
+/*读取下一个空闲页号*/
+static minisql_pgno freelist_get_next(minisql_page *pg){
+    minisql_pgno next_free;
+    memcpy(&next_free,pg->data + MINISQL_FREELIST_NEXT_OFFSET,sizeof(next_free));
+    return next_free;
+}
+/*设置下一个空闲页号
+把下一个空闲页的页号，写入当前空闲页的 data 数组中
+*/
+static void freelist_set_next(minisql_page *pg,minisql_pgno next_free){    
+    memcpy(pg->data+ MINISQL_FREELIST_NEXT_OFFSET,&next_free,sizeof(next_free));
+    pg->dirty = true; /*修改了 pg->data，需要告诉 Pager：这个页面以后要写回磁盘。*/
+}
+
+/*负责决定使用哪个磁盘页
+核心作用是：分配一个磁盘页面，可能复用旧页，也可能创建新页。并返回该页的页号和对应的缓存页指针。
+ * 分配一个磁盘页面，优先复用空闲页，否则追加新页。
+ * 返回新页号及对应的已固定（pin）的缓存页。
+ * 成功返回 MINISQL_OK，失败返回错误码。
+ */
+minisql_errno pager_alloc(minisql_pager *pager,minisql_pgno *pgno_out, minisql_page **page_out)
+{
+    assert(pager != NULL);
+    assert(pgno_out != NULL);
+    assert(page_out != NULL);
+
+    minisql_errno rc   = MINISQL_OK;
+    minisql_pgno  pgno = MINISQL_PGNO_NULL;   /* 结果变量提到分支外 */
+    minisql_page *pg   = NULL;
+
+    if (pager->freelist_head != MINISQL_PGNO_NULL) {
+        /* ================= 路径 A：复用 freelist 头 ================= */
+        minisql_pgno head = pager->freelist_head;
+
+        /* 页 0 是头页，绝不能出现在 freelist 里 */
+        if (head < 1 || head >= pager->page_count) {
+            return MINISQL_ERR_CORRUPT;
+        }
+
+        rc = pager_get(pager, head, &pg);
+        if (rc != MINISQL_OK) {
+            return rc;                    /* pager_get 内部已保证状态不变 */
+        }
+
+        minisql_pgno next = freelist_get_next(pg);
+
+        /* 先校验、再改 freelist_head，不让脏值落进内存状态 */
+        if (next != MINISQL_PGNO_NULL &&
+            (next < 1 || next >= pager->page_count)) {
+            pager_unpin(pager, pg, 0);    /* 校验失败，退货 */
+            return MINISQL_ERR_CORRUPT;
+        }
+
+        pager->freelist_head = next;
+        pgno = head;
+
+    } else {
+        /* ================= 路径 B：追加新页 ================= */
+        minisql_pgno new_pgno = pager->page_count;
+
+        /* ① 先让文件真的变长；失败时内存状态完全没动，直接返回 */
+        while (ftruncate(pager->fd,(off_t)(new_pgno + 1) * MINISQL_PAGE_SIZE) != 0) {
+            if (errno == EINTR) continue;
+            return minisql_errno_sys(errno);
+        }
+
+        /* ② 文件已经有这页了，现在改 page_count 才是安全的 */
+        pager->page_count = new_pgno + 1;
+
+        /* ③ 把它装进缓存 */
+        rc = pager_get(pager, new_pgno, &pg);
+        if (rc != MINISQL_OK) {
+            pager->page_count = new_pgno;  /* 回滚；文件不动，多出的页下次复用 */
+            return rc;
+        }
+
+        pgno = new_pgno;
+    }
+
+    /* ======================= 汇合点 ======================= */
+    memset(pg->data, 0, MINISQL_PAGE_SIZE);  /* 清空内容（路径 B 本来就是零，无妨） */
+    pg->dirty = true;                        /* 必须标脏，否则不会写回 */
+
+    *pgno_out = pgno;
+    *page_out = pg;
+    return MINISQL_OK;
+}
+
+minisql_errno pager_free(minisql_pager *pager, minisql_pgno pgno){
+    if (pgno < 1 || pgno >= pager->page_count) return MINISQL_ERR_CORRUPT;
+
+}
