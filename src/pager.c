@@ -64,7 +64,7 @@ static uint32_t round_up_pow2(uint32_t n){
 minisql_errno pager_open(const char* filename,uint32_t cache_pages,minisql_pager **pager_out){  
     minisql_errno rc; 
    
-    /*打开或关联文件‌：获取数据库文件的文件描述符*/
+    /*打开或关联文件：获取数据库文件的文件描述符*/
     int fd = open(filename,O_RDWR|O_CREAT,0644);
     if (fd== -1){
         
@@ -108,13 +108,16 @@ minisql_errno pager_open(const char* filename,uint32_t cache_pages,minisql_pager
     else
         pager->page_count = st.st_size / MINISQL_PAGE_SIZE;
 
-/*初始化缓存结构‌：把页面缓存数组或哈希表置空，为后续按需加载页做准备*/
+/*初始化缓存结构：把页面缓存数组或哈希表置空，为后续按需加载页做准备*/
     pager->cache_capacity = round_up_pow2(cache_pages);
     assert(pager->cache_capacity >= cache_pages);          /* 不能比请求的小 */
 
-    pager->hash_mask = pager->cache_capacity - 1; /*？？hash_mask用来干什么的*/
+    /* hash_mask = capacity - 1，配合 capacity 已是 2 的幂：
+ * 桶下标 = pgno & hash_mask，用一条位与指令代替取模（除法要几十个周期）。
+ * 这就是 round_up_pow2 存在的唯一理由。 */
+    pager->hash_mask = pager->cache_capacity - 1;
 
-    /*分配缓存页框数组和哈希桶数组‌：frames 数组存放缓存页框，buckets 数组存放哈希桶指针*/
+    /*分配缓存页框数组和哈希桶数组：frames 数组存放缓存页框，buckets 数组存放哈希桶指针*/
     minisql_page *frames = calloc(pager->cache_capacity,sizeof(minisql_page)); /*返回首页框的地址。数组的元素是 minisql_page 结构体本身。*/
     if(!frames){
         
@@ -129,7 +132,6 @@ minisql_errno pager_open(const char* filename,uint32_t cache_pages,minisql_pager
         goto fail_buckets;
     }
     pager->buckets = buckets;
-    /**/
     
     for (uint32_t i=0;i<pager->cache_capacity;i++){
         frames[i].lru_next = i==pager->cache_capacity-1 ? NULL : frames+i+1;                          
@@ -145,7 +147,10 @@ minisql_errno pager_open(const char* filename,uint32_t cache_pages,minisql_pager
 
 
 fail_buckets:
-    free(frames);  /*？？free局部变量frames还是pager里面的frames？？*/
+    /* 这里的 frames 和 pager->frames 是同一块内存。
+     * 用局部变量更安全：走到这个标签时 pager 马上就要被 free 掉，
+     * 再经由 pager->frames 取值会依赖 pager 尚未释放这一隐含前提。 */
+    free(frames);
 fail_frames:
     free(pager);
 fail_pager:

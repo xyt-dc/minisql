@@ -1,6 +1,16 @@
 # CMake build files
-build/
+# 裸写 build/ 只匹配「名为 build 的目录」，build-asan/、build-rel/ 都漏掉了。
+# 用 build*/ 覆盖所有构建目录变体。
+build*/
 cmake-build-*/
+
+# 根目录误用 in-source 构建时产生的文件（一律不该进版本库）
+/CMakeCache.txt
+/CMakeFiles/
+/CTestTestfile.cmake
+/Makefile
+/cmake_install.cmake
+/Testing/
 
 # Object files
 *.o
@@ -15,8 +25,13 @@ cmake-build-*/
 *.dll
 
 # Executables
-minisql
-test_pager
+# 注意：必须加前导斜杠锚定到仓库根目录。
+# 写成裸的 `minisql` 会匹配任意层级的同名目录，
+# 把 include/minisql/ 整个头文件目录一起忽略掉。
+/minisql
+/test_pager
+/test_db
+/test_btree
 *.exe
 
 # Database / test artifacts
@@ -24,6 +39,8 @@ test_pager
 *.db-journal
 *.db-wal
 *.db-shm
+*.tmp
+/tests/tmp.db
 
 # Editor / IDE
 .vscode/
